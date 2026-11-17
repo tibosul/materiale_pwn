@@ -1,0 +1,138 @@
+# Cheatsheet `objdump` (+ `strings`) — recon rapid pe binare
+
+> Doar `objdump` și `strings`. Exemplu: `./binar` (ELF 32-bit, stripped, no-PIE).
+> `objdump` **nu** decompilează în C — îți dă assembly. Dar pentru CTF e suficient.
+
+---
+
+## 0. Ce e binarul / ce protecții
+
+`objdump` nu-ți dă un rezumat de protecții gata făcut, dar îl deduci din header:
+
+```bash
+objdump -f binar        # file header: arhitectura + flags (EXEC_P = no-PIE)
+objdump -p binar        # program headers; cauti GNU_STACK:
+                        #   "rwx" -> stiva executabila (NX off)
+                        #   "rw-" -> NX on (nu injectezi shellcode)
+```
+
+**Reguli rapide:**
+- flag `EXEC_P` în `objdump -f` → **no-PIE**, adresele `0x0804xxxx` sunt FIXE (bun pt ret2win).
+- fără `EXEC_P` (e `DYNAMIC`) → PIE, ai nevoie de leak.
+- `GNU_STACK rw-` → NX on → ret2win / ROP, nu shellcode pe stivă.
+
+---
+
+## 1. Disassembly (codul)
+
+```bash
+objdump -d binar                 # tot codul, sintaxa AT&T (mov %src,%dst)
+objdump -d -M intel binar        # sintaxa Intel (mov dst,src) <- mai citibil
+objdump -d -M intel binar | less # navighezi: / cauta, q iese
+
+objdump -d -j .text -M intel binar   # doar sectiunea .text
+objdump -d -j .plt  -M intel binar   # stub-urile functiilor din libc (PLT)
+```
+
+Căutări utile (grep pe output):
+```bash
+objdump -d binar | grep -B5 '<system@plt>'      # contextul fiecarui call system
+objdump -d binar | grep -iE 'call|jmp' | grep -i system
+```
+
+**Pe binar stripped** n-ai nume de funcții. Cauți după:
+- call-uri către PLT (`system@plt`, `printf@plt` — astea RĂMÂN chiar stripped)
+- adrese de string-uri încărcate: `push $0x804a009`
+- prologul de funcție: `push %ebp ; mov %esp,%ebp` (32-bit) sau `push %rbp` (64-bit)
+
+---
+
+## 2. Secțiuni & headere (harta binarului)
+
+```bash
+objdump -f binar    # file header: start address (entry point), flags
+objdump -h binar    # lista sectiunilor cu adrese (VMA): .text .rodata .data .bss
+objdump -p binar    # program/segment headers (inclusiv GNU_STACK pt NX)
+```
+
+Secțiuni de reținut:
+
+| Secțiune | Ce conține |
+|----------|-----------|
+| `.text`  | cod executabil |
+| `.rodata`| constante read-only (aici stau string-uri gen `/bin/sh`) |
+| `.data`  | variabile globale inițializate |
+| `.bss`   | globale neinițializate |
+| `.plt`   | stub-uri apeluri libc |
+| `.got` / `.got.plt` | pointeri rezolvați dinamic |
+
+---
+
+## 3. Simboluri (funcții importate)
+
+```bash
+objdump -t binar    # symbol table -> GOL ("no symbols") daca e stripped
+objdump -T binar    # dynamic symbol table -> RAMANE si pe stripped!
+objdump -R binar    # relocari: mapeaza intrarile GOT -> nume functie
+```
+
+Ce funcții periculoase importă din libc (țintele tale: `system`, `gets`, `scanf`):
+```bash
+objdump -T binar | grep -i func
+objdump -R binar    # vezi system, printf, setvbuf... chiar daca binarul e stripped
+```
+
+---
+
+## 4. String-uri + ADRESELE lor (crucial pt ret2win)
+
+```bash
+strings binar            # toate string-urile (fara adrese)
+strings -t x binar       # cu OFFSET IN FISIER (hex) -- ATENTIE: NU e adresa virtuala!
+```
+
+Adresa reală (virtuală) a unui string — din hexdump-ul secțiunii cu `objdump -s`:
+```bash
+objdump -s -j .rodata binar
+```
+```
+ 804a000 03000000 01000200 002f6269 6e2f7368  ........./bin/sh
+ ^adresa de start a liniei      ^numeri byte-ii: '/'(0x2f) e la 804a009
+ => string-ul "/bin/sh" e la 0x0804a009
+```
+
+> **Capcană:** `strings -t x` dă offset **în fișier** (ex. `0x2009`), NU adresa virtuală
+> (`0x804a009`). Pentru adresa reală, citește eticheta liniei din `objdump -s`.
+
+Cine folosește string-ul în cod (xref manual):
+```bash
+objdump -d binar | grep '0x804a009'
+# -> 80492db: push $0x804a009   (chiar inainte de call system = functia "win")
+```
+
+---
+
+## 5. Hexdump brut
+
+```bash
+objdump -s binar              # hexdump pe toate sectiunile
+objdump -s -j .rodata binar   # hexdump pe o sectiune anume
+objdump -s -j .data binar
+```
+
+---
+
+## 6. Flux tipic pe un CTF pwn (ordinea comenzilor)
+
+1. `objdump -f binar` → arhitectură + EXEC_P (no-PIE?)
+2. `objdump -p binar` → GNU_STACK (NX?)
+3. `objdump -T binar | grep func` → ce funcții periculoase importă (`system`, `gets`)
+4. `strings binar` → string-uri utile (`/bin/sh`, `flag`, `cat`)
+5. `objdump -s -j .rodata binar` → adresa reală a string-ului țintă
+6. `objdump -d -M intel binar | less` → citești codul / funcția "win"
+7. `objdump -d binar | grep '0x<adresa_string>'` → xref la țintă
+8. gdb + pattern ciclic → offset-ul; apoi payload: `'A'*offset + p32(tinta)`
+
+---
+
+**Mnemonic:** `objdump -f` → `-p` → `-T` → `strings` → `objdump -s` → `objdump -d`
